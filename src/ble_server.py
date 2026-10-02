@@ -7,8 +7,12 @@ from CoreBluetooth import (
     CBAdvertisementDataLocalNameKey,
     CBAdvertisementDataServiceUUIDsKey,
     CBAttributePermissionsReadable,
+    CBAttributePermissionsWriteable,
+    CBATTErrorSuccess,
+    CBCharacteristicPropertyIndicate,
     CBCharacteristicPropertyNotify,
     CBCharacteristicPropertyRead,
+    CBCharacteristicPropertyWrite,
     CBMutableCharacteristic,
     CBMutableService,
     CBPeripheralManager,
@@ -22,7 +26,9 @@ from src.config import CADENCE_DEVICE_NAME, POWER_DEVICE_NAME, VIRTUAL_DRIVE_RAT
 
 UUID_CSC_SERVICE = CBUUID.UUIDWithString_("1816")
 UUID_CSC_MEASUREMENT = CBUUID.UUIDWithString_("2A5B")
+UUID_CSC_FEATURE = CBUUID.UUIDWithString_("2A5C")
 UUID_SENSOR_LOCATION = CBUUID.UUIDWithString_("2A5D")
+UUID_SC_CONTROL_POINT = CBUUID.UUIDWithString_("2A55")
 
 UUID_CP_SERVICE = CBUUID.UUIDWithString_("1818")
 UUID_CP_MEASUREMENT = CBUUID.UUIDWithString_("2A63")
@@ -98,6 +104,7 @@ class CadencePeripheralDelegate(NSObject):
         self.bike_state = bike_state
         self.manager = None
         self.char = None
+        self.control_char = None
         return self
 
     def start(self):
@@ -109,16 +116,30 @@ class CadencePeripheralDelegate(NSObject):
                 UUID_CSC_MEASUREMENT,
                 CBCharacteristicPropertyNotify,
                 None,
-                0,
+                CBAttributePermissionsReadable,
+            )
+            feature = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
+                UUID_CSC_FEATURE,
+                CBCharacteristicPropertyRead,
+                NSData.dataWithBytes_length_(b"\x03\x00", 2),
+                CBAttributePermissionsReadable,
             )
             loc = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
                 UUID_SENSOR_LOCATION,
                 CBCharacteristicPropertyRead,
-                NSData.dataWithBytes_length_(b"\x02", 1),
+                NSData.dataWithBytes_length_(b"\x00", 1),
                 CBAttributePermissionsReadable,
             )
+            self.control_char = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
+                UUID_SC_CONTROL_POINT,
+                CBCharacteristicPropertyWrite | CBCharacteristicPropertyIndicate,
+                None,
+                CBAttributePermissionsWriteable,
+            )
             service = CBMutableService.alloc().initWithType_primary_(UUID_CSC_SERVICE, True)
-            service.setCharacteristics_([self.char, loc])
+            service.setCharacteristics_(
+                [self.char, feature, loc, self.control_char]
+            )
             self.manager.addService_(service)
 
     def peripheralManager_didAddService_error_(self, peripheral, service, error):
@@ -131,6 +152,32 @@ class CadencePeripheralDelegate(NSObject):
         }
         self.manager.startAdvertising_(adv)
 
+    def peripheralManager_didReceiveWriteRequests_(self, peripheral, requests):
+        for request in requests:
+            if not request.characteristic().UUID().isEqual_(UUID_SC_CONTROL_POINT):
+                peripheral.respondToRequest_withResult_(request, CBATTErrorSuccess)
+                continue
+
+            value = bytes(request.value() or b"")
+            opcode = value[0] if value else 0
+            response = bytes((0x10, opcode, 0x02))
+
+            if opcode == 0x01 and len(value) == 5:
+                engine.total_wheel_revs = int.from_bytes(value[1:5], "little")
+                engine.fractional_wheel_revs = 0.0
+                response = bytes((0x10, 0x01, 0x01))
+            elif opcode == 0x01 and len(value) != 5:
+                response = bytes((0x10, 0x01, 0x03))
+
+            peripheral.respondToRequest_withResult_(request, CBATTErrorSuccess)
+
+            if self.control_char:
+                ns_data = NSData.dataWithBytes_length_(response, len(response))
+                self.manager.updateValue_forCharacteristic_onSubscribedCentrals_(
+                    ns_data,
+                    self.control_char,
+                    [request.central()],
+                )
 
     def update(self):
         if self.manager and self.manager.isAdvertising() and self.char:
