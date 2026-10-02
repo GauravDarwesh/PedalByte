@@ -1,26 +1,34 @@
+import math
 import struct
 import time
+
 import objc
-from Foundation import NSObject, NSData
 from CoreBluetooth import (
-    CBPeripheralManager,
-    CBMutableService,
-    CBMutableCharacteristic,
-    CBCharacteristicPropertyNotify,
-    CBCharacteristicPropertyRead,
-    CBAttributePermissionsReadable,
-    CBPeripheralManagerStatePoweredOn,
-    CBUUID,
     CBAdvertisementDataLocalNameKey,
     CBAdvertisementDataServiceUUIDsKey,
+    CBAttributePermissionsReadable,
+    CBAttributePermissionsWriteable,
+    CBATTErrorSuccess,
+    CBCharacteristicPropertyIndicate,
+    CBCharacteristicPropertyNotify,
+    CBCharacteristicPropertyRead,
+    CBCharacteristicPropertyWrite,
+    CBMutableCharacteristic,
+    CBMutableService,
+    CBPeripheralManager,
+    CBPeripheralManagerStatePoweredOn,
+    CBUUID,
 )
+from Foundation import NSData, NSObject
 from PyObjCTools import AppHelper
 
 from src.config import CADENCE_DEVICE_NAME, POWER_DEVICE_NAME, VIRTUAL_DRIVE_RATIO
 
 UUID_CSC_SERVICE = CBUUID.UUIDWithString_("1816")
 UUID_CSC_MEASUREMENT = CBUUID.UUIDWithString_("2A5B")
+UUID_CSC_FEATURE = CBUUID.UUIDWithString_("2A5C")
 UUID_SENSOR_LOCATION = CBUUID.UUIDWithString_("2A5D")
+UUID_SC_CONTROL_POINT = CBUUID.UUIDWithString_("2A55")
 
 UUID_CP_SERVICE = CBUUID.UUIDWithString_("1818")
 UUID_CP_MEASUREMENT = CBUUID.UUIDWithString_("2A63")
@@ -84,8 +92,10 @@ def pack_csc_payload(rpm):
 
 
 def pack_power_payload(watts):
-    flags = 0x0000
-    return struct.pack("<Hh", flags, int(watts))
+    if not math.isfinite(watts):
+        watts = 0.0
+    watts_int = max(-32768, min(32767, int(round(watts))))
+    return struct.pack("<Hh", 0, watts_int)
 
 
 class CadencePeripheralDelegate(NSObject):
@@ -94,6 +104,7 @@ class CadencePeripheralDelegate(NSObject):
         self.bike_state = bike_state
         self.manager = None
         self.char = None
+        self.control_char = None
         return self
 
     def start(self):
@@ -105,24 +116,68 @@ class CadencePeripheralDelegate(NSObject):
                 UUID_CSC_MEASUREMENT,
                 CBCharacteristicPropertyNotify,
                 None,
-                0,
+                CBAttributePermissionsReadable,
+            )
+            feature = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
+                UUID_CSC_FEATURE,
+                CBCharacteristicPropertyRead,
+                NSData.dataWithBytes_length_(b"\x03\x00", 2),
+                CBAttributePermissionsReadable,
             )
             loc = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
                 UUID_SENSOR_LOCATION,
                 CBCharacteristicPropertyRead,
-                NSData.dataWithBytes_length_(b"\x02", 1),
+                NSData.dataWithBytes_length_(b"\x00", 1),
                 CBAttributePermissionsReadable,
             )
+            self.control_char = CBMutableCharacteristic.alloc().initWithType_properties_value_permissions_(
+                UUID_SC_CONTROL_POINT,
+                CBCharacteristicPropertyWrite | CBCharacteristicPropertyIndicate,
+                None,
+                CBAttributePermissionsWriteable,
+            )
             service = CBMutableService.alloc().initWithType_primary_(UUID_CSC_SERVICE, True)
-            service.setCharacteristics_([self.char, loc])
+            service.setCharacteristics_(
+                [self.char, feature, loc, self.control_char]
+            )
             self.manager.addService_(service)
 
     def peripheralManager_didAddService_error_(self, peripheral, service, error):
+        if error is not None:
+            print(f"[BLE] Failed to add CSC service: {error}")
+            return
         adv = {
             CBAdvertisementDataLocalNameKey: CADENCE_DEVICE_NAME,
             CBAdvertisementDataServiceUUIDsKey: [UUID_CSC_SERVICE],
         }
         self.manager.startAdvertising_(adv)
+
+    def peripheralManager_didReceiveWriteRequests_(self, peripheral, requests):
+        for request in requests:
+            if not request.characteristic().UUID().isEqual_(UUID_SC_CONTROL_POINT):
+                peripheral.respondToRequest_withResult_(request, CBATTErrorSuccess)
+                continue
+
+            value = bytes(request.value() or b"")
+            opcode = value[0] if value else 0
+            response = bytes((0x10, opcode, 0x02))
+
+            if opcode == 0x01 and len(value) == 5:
+                engine.total_wheel_revs = int.from_bytes(value[1:5], "little")
+                engine.fractional_wheel_revs = 0.0
+                response = bytes((0x10, 0x01, 0x01))
+            elif opcode == 0x01 and len(value) != 5:
+                response = bytes((0x10, 0x01, 0x03))
+
+            peripheral.respondToRequest_withResult_(request, CBATTErrorSuccess)
+
+            if self.control_char:
+                ns_data = NSData.dataWithBytes_length_(response, len(response))
+                self.manager.updateValue_forCharacteristic_onSubscribedCentrals_(
+                    ns_data,
+                    self.control_char,
+                    [request.central()],
+                )
 
     def update(self):
         if self.manager and self.manager.isAdvertising() and self.char:
@@ -163,6 +218,9 @@ class PowerPeripheralDelegate(NSObject):
             self.manager.addService_(service)
 
     def peripheralManager_didAddService_error_(self, peripheral, service, error):
+        if error is not None:
+            print(f"[BLE] Failed to add cycling power service: {error}")
+            return
         adv = {
             CBAdvertisementDataLocalNameKey: POWER_DEVICE_NAME,
             CBAdvertisementDataServiceUUIDsKey: [UUID_CP_SERVICE],

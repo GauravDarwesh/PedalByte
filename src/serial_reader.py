@@ -1,4 +1,4 @@
-"""Read a simple line protocol from an MCU / sensor bridge.
+"""Read and validate the MCU telemetry line protocol.
 
 Expected line format:
     RPM:82.4 Level:5 Watts:147
@@ -7,13 +7,16 @@ The protocol is intentionally bike-agnostic. The upstream controller can be an
 Arduino, ESP32, Raspberry Pi Pico, or another serial-capable adapter.
 """
 
+import math
 import re
 
 import serial
 
 
 PATTERN = re.compile(
-    r"RPM:(?P<rpm>[0-9.]+)\s+Level:(?P<level>\d+)\s+Watts:(?P<watts>[0-9.]+)"
+    r"^\s*RPM:(?P<rpm>[0-9]+(?:\.[0-9]+)?)\s+"
+    r"Level:(?P<level>[0-9]+)\s+"
+    r"Watts:(?P<watts>[0-9]+(?:\.[0-9]+)?)\s*$"
 )
 
 
@@ -23,15 +26,28 @@ class SerialReader:
         self.state = state
         print(f"[SERIAL] Connected to adapter on {port}")
 
-    def update(self) -> None:
+    def update(self) -> bool:
+        """Read one line and apply it when it contains valid telemetry."""
         try:
             line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-            match = PATTERN.search(line)
+            match = PATTERN.fullmatch(line)
             if not match:
-                return
+                return False
 
-            self.state.rpm = float(match.group("rpm"))
-            self.state.level = int(match.group("level"))
-            self.state.watts = float(match.group("watts"))
+            rpm = float(match.group("rpm"))
+            level = int(match.group("level"))
+            watts = float(match.group("watts"))
+
+            # Reject non-finite or impossible telemetry before it reaches the
+            # shared state and downstream dashboard/BLE calculations.
+            if not all(math.isfinite(value) for value in (rpm, watts)):
+                return False
+            if rpm < 0 or watts < 0 or level < 0:
+                return False
+
+            self.state.rpm = rpm
+            self.state.level = level
+            self.state.watts = watts
+            return True
         except (OSError, ValueError, serial.SerialException):
-            pass
+            return False
