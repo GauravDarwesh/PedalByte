@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+*.log
+workout_history.csv
+workout_share_*.png
+.pytest_cache/
