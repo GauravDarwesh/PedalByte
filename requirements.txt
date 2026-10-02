@@ -1,0 +1,5 @@
+bleak
+Pillow
+pyobjc-framework-Cocoa
+pyobjc-framework-CoreBluetooth
+pyserial
