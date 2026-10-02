@@ -1,19 +1,21 @@
+import math
 import struct
 import time
+
 import objc
-from Foundation import NSObject, NSData
 from CoreBluetooth import (
-    CBPeripheralManager,
-    CBMutableService,
-    CBMutableCharacteristic,
-    CBCharacteristicPropertyNotify,
-    CBCharacteristicPropertyRead,
-    CBAttributePermissionsReadable,
-    CBPeripheralManagerStatePoweredOn,
-    CBUUID,
     CBAdvertisementDataLocalNameKey,
     CBAdvertisementDataServiceUUIDsKey,
+    CBAttributePermissionsReadable,
+    CBCharacteristicPropertyNotify,
+    CBCharacteristicPropertyRead,
+    CBMutableCharacteristic,
+    CBMutableService,
+    CBPeripheralManager,
+    CBPeripheralManagerStatePoweredOn,
+    CBUUID,
 )
+from Foundation import NSData, NSObject
 from PyObjCTools import AppHelper
 
 from src.config import CADENCE_DEVICE_NAME, POWER_DEVICE_NAME, VIRTUAL_DRIVE_RATIO
@@ -84,8 +86,10 @@ def pack_csc_payload(rpm):
 
 
 def pack_power_payload(watts):
-    flags = 0x0000
-    return struct.pack("<Hh", flags, int(watts))
+    if not math.isfinite(watts):
+        watts = 0.0
+    watts_int = max(-32768, min(32767, int(round(watts))))
+    return struct.pack("<Hh", 0, watts_int)
 
 
 class CadencePeripheralDelegate(NSObject):
@@ -118,11 +122,15 @@ class CadencePeripheralDelegate(NSObject):
             self.manager.addService_(service)
 
     def peripheralManager_didAddService_error_(self, peripheral, service, error):
+        if error is not None:
+            print(f"[BLE] Failed to add CSC service: {error}")
+            return
         adv = {
             CBAdvertisementDataLocalNameKey: CADENCE_DEVICE_NAME,
             CBAdvertisementDataServiceUUIDsKey: [UUID_CSC_SERVICE],
         }
         self.manager.startAdvertising_(adv)
+
 
     def update(self):
         if self.manager and self.manager.isAdvertising() and self.char:
@@ -163,6 +171,9 @@ class PowerPeripheralDelegate(NSObject):
             self.manager.addService_(service)
 
     def peripheralManager_didAddService_error_(self, peripheral, service, error):
+        if error is not None:
+            print(f"[BLE] Failed to add cycling power service: {error}")
+            return
         adv = {
             CBAdvertisementDataLocalNameKey: POWER_DEVICE_NAME,
             CBAdvertisementDataServiceUUIDsKey: [UUID_CP_SERVICE],
