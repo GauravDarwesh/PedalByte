@@ -23,6 +23,8 @@ from src.config import (
 )
 from src.serial_reader import SerialReader
 
+TELEMETRY_TIMEOUT_SECONDS = 2.0
+
 
 def calculate_speed_mph(rpm):
     if rpm <= 0:
@@ -34,31 +36,51 @@ def calculate_speed_mph(rpm):
 
 def serial_worker(reader, state):
     last_valid_time = None
+    last_integration_time = None
 
     while True:
         if not reader or not reader.ser or not reader.ser.is_open:
             last_valid_time = None
+            last_integration_time = None
+            state.rpm = 0.0
+            state.watts = 0.0
             time.sleep(1)
             continue
 
         try:
+            now = time.monotonic()
             if reader.update():
-                now = time.time()
-                if last_valid_time is not None:
-                    dt = now - last_valid_time
-                    if 0 < dt <= 2.0 and state.rpm > 0:
+                if last_integration_time is not None:
+                    dt = now - last_integration_time
+                    if 0 < dt <= TELEMETRY_TIMEOUT_SECONDS and state.rpm > 0:
                         state.total_wheel_revs += (
                             (state.rpm * VIRTUAL_DRIVE_RATIO) / 60.0
                         ) * dt
+                last_integration_time = now
                 last_valid_time = now
             else:
-                # A missing/invalid frame means the previous RPM is stale. Do
-                # not continue integrating distance from an old value.
-                last_valid_time = None
+                # Do not integrate from an old frame. If the stream stays
+                # silent long enough, clear the stale telemetry shown to the UI.
+                last_integration_time = None
+                if (
+                    last_valid_time is not None
+                    and now - last_valid_time > TELEMETRY_TIMEOUT_SECONDS
+                ):
+                    state.rpm = 0.0
+                    state.watts = 0.0
+                    last_valid_time = None
 
             time.sleep(0.01)
         except Exception:
-            last_valid_time = None
+            now = time.monotonic()
+            last_integration_time = None
+            if (
+                last_valid_time is not None
+                and now - last_valid_time > TELEMETRY_TIMEOUT_SECONDS
+            ):
+                state.rpm = 0.0
+                state.watts = 0.0
+                last_valid_time = None
             time.sleep(1)
 
 
@@ -102,16 +124,23 @@ async def run_heart_rate_ble(state):
                         break
 
             if target:
-                async with BleakClient(target) as client:
-                    if client.is_connected:
-                        await client.start_notify(
-                            HEART_RATE_UUID, hr_data_handler(state)
-                        )
-                        while client.is_connected:
-                            await asyncio.sleep(1)
+                try:
+                    async with BleakClient(target) as client:
+                        if client.is_connected:
+                            await client.start_notify(
+                                HEART_RATE_UUID, hr_data_handler(state)
+                            )
+                            while client.is_connected:
+                                await asyncio.sleep(1)
+                finally:
+                    # A disconnected sensor must not leave the last heart-rate
+                    # value active in calorie and Zone 2 calculations.
+                    state.heart_rate = 0
             else:
+                state.heart_rate = 0
                 await asyncio.sleep(5)
         except Exception:
+            state.heart_rate = 0
             await asyncio.sleep(5)
 
 
@@ -133,6 +162,7 @@ class MinimalistDashboard:
         self.is_running = False
         self.session_start_time = None
         self.session_start_wheel_revs = 0.0
+        self.last_update_monotonic = time.monotonic()
         self.caffeinate_process = None
         self.total_seconds_in_zone2 = 0
         self.total_active_seconds = 0
@@ -194,16 +224,21 @@ class MinimalistDashboard:
             w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"),duration,avg_hr,f"{dist:.2f}",f"{self.accumulated_calories:.0f}",f"{(self.accumulated_calories*0.65/9):.1f}",f"{eff:.0f}%"])
 
     def update_loop(self):
+        now = time.monotonic()
+        loop_dt = max(0.0, now - self.last_update_monotonic)
+        self.last_update_monotonic = now
+        active_dt = min(loop_dt, 1.0)
+
         hr,rpm,watts=self.state.heart_rate,self.state.rpm,self.state.watts
         distance=self.session_distance_miles() if self.is_running else 0.0
         speed=calculate_speed_mph(rpm)
         if self.is_running and self.session_start_time is not None:
             elapsed=int(time.time()-self.session_start_time); h,rem=divmod(elapsed,3600); m,s=divmod(rem,60); self.lbl_timer.config(text=f"{h:02d}:{m:02d}:{s:02d}")
             if rpm>5:
-                self.total_active_seconds += .25
+                self.total_active_seconds += active_dt
                 if hr>0: self.hr_samples.append(hr)
-                self.accumulated_calories += max(0.0,(((0.4472*hr)-(0.1263*USER_WEIGHT_KG)+(0.074*USER_AGE)-20.4022)/(4.184*60.0))*0.25) if hr>90 else max(0.0,(watts*0.25)/(1000*0.24))
-                if ZONE_LOW_BPM<=hr<=ZONE_HIGH_BPM: self.total_seconds_in_zone2+=.25; self.current_streak_seconds+=.25
+                self.accumulated_calories += max(0.0,(((0.4472*hr)-(0.1263*USER_WEIGHT_KG)+(0.074*USER_AGE)-20.4022)/(4.184*60.0))*active_dt) if hr>90 else max(0.0,(watts*active_dt)/(1000*0.24))
+                if ZONE_LOW_BPM<=hr<=ZONE_HIGH_BPM: self.total_seconds_in_zone2+=active_dt; self.current_streak_seconds+=active_dt
                 else: self.current_streak_seconds=0
                 self.has_hit_zone2_yet = self.has_hit_zone2_yet or (ZONE_LOW_BPM<=hr<=ZONE_HIGH_BPM)
         else: self.lbl_timer.config(text="00:00:00")
