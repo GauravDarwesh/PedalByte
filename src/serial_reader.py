@@ -26,12 +26,13 @@ class SerialReader:
         self.state = state
         print(f"[SERIAL] Connected to adapter on {port}")
 
-    def update(self) -> None:
+    def update(self) -> bool:
+        """Read one line and apply it when it contains valid telemetry."""
         try:
             line = self.ser.readline().decode("utf-8", errors="ignore").strip()
             match = PATTERN.fullmatch(line)
             if not match:
-                return
+                return False
 
             rpm = float(match.group("rpm"))
             level = int(match.group("level"))
@@ -40,12 +41,13 @@ class SerialReader:
             # Reject non-finite or impossible telemetry before it reaches the
             # shared state and downstream dashboard/BLE calculations.
             if not all(math.isfinite(value) for value in (rpm, watts)):
-                return
+                return False
             if rpm < 0 or watts < 0 or level < 0:
-                return
+                return False
 
             self.state.rpm = rpm
             self.state.level = level
             self.state.watts = watts
+            return True
         except (OSError, ValueError, serial.SerialException):
-            pass
+            return False
